@@ -159,6 +159,7 @@
         attribution: 'OSM'
     });
     
+    sathyb.addTo(map);
     L.control.layers({"Satelit hibrid": sathyb, "Satelit": sat, "OSM": osm }, null, { position: 'topright' }).addTo(map);
     L.control.scale({ imperial: false, maxWidth: 200, position: 'bottomright' }).addTo(map);
 

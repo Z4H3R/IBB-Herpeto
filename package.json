@@ -1,0 +1,14 @@
+{
+  "name": "ibb-herpeto",
+  "version": "0.1.0",
+  "private": true,
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "http-server": "^14.1.1",
+    "playwright": "^1.36.0"
+  },
+  "scripts": {
+    "start": "http-server -p 8000",
+    "test": "playwright test"
+  }
+}

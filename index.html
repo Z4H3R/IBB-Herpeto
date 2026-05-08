@@ -360,5 +360,383 @@
     }
 
 </script>
+<script>
+// Load CSV of expert checks and build a map of squares with missing expert data (column 4 empty)
+const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vT57aHhmP-8jeJEC0JlU2quIBJ_BOOUWm_8kbf3jf9O2QKPNo6s1AKbl_5y-xzrhktMl8mprdUapLy7/pub?gid=0&single=true&output=csv";
+let noDataMap = {}; // { '1kmE5291N2471': Set(['Species A','Species B']) }
+
+function splitCSVLine(line){
+  // split on commas not inside quotes
+  const parts = line.match(/(?:\s*"([^"]*)"\s*|\s*([^,]+)\s*|\s*(?=,))/g);
+  if(parts){
+    return parts.map(p=>{
+      p = p.trim();
+      if(p.startsWith('"') && p.endsWith('"')) p = p.slice(1,-1);
+      return p.replace(/""/g,'"');
+    });
+  }
+  // fallback simple split
+  return line.split(/,(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)/).map(s=>s.replace(/^"|"$/g,'').trim());
+}
+
+async function loadNoDataCSV(){
+  try{
+    const res = await fetch(CSV_URL);
+    if(!res.ok) return;
+    const text = await res.text();
+    const lines = text.split(/\r?\n/).filter(l=>l.trim().length>0);
+    let start = 0;
+    if(lines[0] && lines[0].toLowerCase().startsWith('specie')) start = 1;
+    const map = {};
+    for(let i=start;i<lines.length;i++){
+      const cols = splitCSVLine(lines[i]);
+      const specie = (cols[0]||'').trim();
+      const region = (cols[1]||'').trim();
+      const code = (cols[2]||'').trim();
+      const expert = (cols[3]||'').trim();
+      if(!code || !specie) continue;
+      if(!expert){
+        if(!map[code]) map[code] = new Set();
+        map[code].add(specie);
+      }
+    }
+    noDataMap = map;
+    console.log('No-data CSV loaded, entries:', Object.keys(noDataMap).length);
+  }catch(e){
+    console.warn('Failed to load CSV', e);
+  }
+}
+
+// Refresh every 5 minutes and on load
+document.addEventListener('DOMContentLoaded', ()=>{
+  loadNoDataCSV();
+  setInterval(loadNoDataCSV, 5*60*1000);
+
+  const nodataCheckbox = document.getElementById('nodata-checkbox');
+  if(nodataCheckbox){
+    nodataCheckbox.addEventListener('change', ()=>{
+      // trigger any existing filter logic
+      if(typeof applyFilters === 'function') applyFilters();
+    });
+  }
+
+  // When a popup opens, rewrite its content to show only species with missing data if checkbox is checked
+  if(typeof map !== 'undefined'){
+    map.on('popupopen', (e)=>{
+      try{
+        const popup = e.popup;
+        const source = popup._source;
+        const props = source && source.feature && source.feature.properties;
+        if(!props) return;
+        const code = props.Cod_patrat || props.Cod_Patrat || props.cod_patrat;
+        const checkbox = document.getElementById('nodata-checkbox');
+        if(!checkbox || !checkbox.checked) return; // nothing to do
+        const missing = noDataMap[code] || new Set();
+        // Build minimal popup listing only species that are YES in props and in missing set
+        let out = '<div class="popup-header">' + (code || '') + '</div>';
+        out += '<div style="font-size:13px;margin-top:6px;">';
+        let found=false;
+        for(const k in props){
+          if(['Cod_patrat','Regiune','centroid_lon','centroid_lat'].includes(k)) continue;
+          if(props[k] === 'YES' && missing.has(k)){
+            out += '<div class="specie-yes">' + k + '</div>';
+            found=true;
+          }
+        }
+        if(!found) out += '<div style="color:#bbb;font-size:13px;">Nicio specie fără înregistrări aici.</div>';
+        out += '</div>';
+        const contentNode = popup.getElement ? popup.getElement().querySelector('.leaflet-popup-content') : document.querySelector('.leaflet-popup-content');
+        if(contentNode) contentNode.innerHTML = out;
+      }catch(err){
+        console.warn('popup rewrite error', err);
+      }
+    });
+  }
+});
+</script>
+<script>
+// Additional CSV-driven status overlay and popup enrichment
+const CSV_URL_2 = "https://docs.google.com/spreadsheets/d/e/2PACX-1vT57aHhmP-8jeJEC0JlU2quIBJ_BOOUWm_8kbf3jf9O2QKPNo6s1AKbl_5y-xzrhktMl8mprdUapLy7/pub?gid=0&single=true&output=csv";
+let expertMap = {}; // { code: { species: expertValue } }
+let statusLayer = null; let statusOutlineLayer = null; 
+
+// Make activeAllocationColumn a window property so it's globally accessible
+window.activeAllocationColumn = null;
+
+function splitCSVLineSimple(line){
+  return line.split(/,(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)/).map(s=>s.replace(/^"|"$/g,'').trim());
+}
+
+async function buildExpertMapsAndStatus(){
+  try{
+    const res = await fetch(CSV_URL_2);
+    if(!res.ok) return;
+    const text = await res.text();
+    const lines = text.split(/\r?\n/).filter(l=>l.trim().length>0);
+    let start = 0;
+    if(lines[0] && lines[0].toLowerCase().startsWith('specie')) start = 1;
+    
+    // Map allocation column to CSV column index
+    const columnMap = { '2026-1': 3, '2026-2': 4, '2027-1': 5, '2027-2': 6 };
+    const expertColumnIdx = columnMap[window.activeAllocationColumn] || 3;
+    
+    const emap = {};
+    for(let i=start;i<lines.length;i++){
+      const cols = splitCSVLineSimple(lines[i]);
+      const specie = (cols[0]||'').trim();
+      const region = (cols[1]||'').trim();
+      const code = (cols[2]||'').trim();
+      const expert = (cols[expertColumnIdx]||'').trim();
+      if(!code || !specie) continue;
+      emap[code] = emap[code] || {};
+      emap[code][specie] = expert;
+    }
+    expertMap = emap;
+    // update status overlay
+    if(typeof map !== 'undefined'){
+      if(!statusLayer){
+          if(!map.getPane('statusPane')){ map.createPane('statusPane'); map.getPane('statusPane').style.zIndex = 650; }
+          statusLayer = L.layerGroup([], { pane: 'statusPane' });
+          statusOutlineLayer = L.geoJSON(null, {
+            pane: 'statusPane',
+            style: function(feature){
+              return { color: (feature && feature.properties && feature.properties._statusColor) ? feature.properties._statusColor : '#000', weight: 6, fill: false }; // thicker outline
+            }
+          });
+      }
+      statusLayer.clearLayers();
+      (data.features||[]).forEach(f=>{
+        // only add outlines for features currently visible by filters (if markerLayer is used to represent visible features)
+        let visibleCodes = null;
+        try{
+          if(typeof markerLayer !== 'undefined' && markerLayer && map.hasLayer(markerLayer)){
+            visibleCodes = new Set();
+            markerLayer.getLayers().forEach(l=>{ try{ if(l.feature && l.feature.properties && l.feature.properties.Cod_patrat) visibleCodes.add(l.feature.properties.Cod_patrat); }catch(e){} });
+          }
+        }catch(e){ visibleCodes = null; }
+
+        const props = f.properties || {};
+        const code = props.Cod_patrat;
+        if(!code) return;
+        let totalYes = 0, missingCount = 0;
+        for(const k in props){
+          if(['Cod_patrat','Regiune','centroid_lon','centroid_lat'].includes(k)) continue;
+          if(props[k] === 'YES'){
+            totalYes++;
+            const expert = (expertMap[code] && expertMap[code][k]) || '';
+            if(!expert) missingCount++;
+          }
+        }
+        let color = '#cccccc';
+        if(totalYes>0){
+          if(missingCount === 0) color = 'red';
+          else if(missingCount === totalYes) color = 'green';
+          else color = 'yellow';
+        }
+        const lat = props.centroid_lat, lng = props.centroid_lon;
+        if(lat && lng){
+          // markers removed; using outlines only
+          if(statusOutlineLayer){
+            try{ f.properties = f.properties || {}; f.properties._statusColor = color; statusOutlineLayer.addData(f); }catch(e){}
+          }
+        }
+      });
+    }
+    console.log('expertMap built entries:', Object.keys(expertMap).length);
+    // expose to window for external access and tests
+    window.expertMap = expertMap;
+    window.statusLayer = statusLayer; window.statusOutlineLayer = statusOutlineLayer;
+  }catch(e){ console.warn('buildExpertMapsAndStatus error', e); }
+}
+
+// initial run and periodic refresh
+buildExpertMapsAndStatus();
+setInterval(buildExpertMapsAndStatus, 5*60*1000);
+
+// Enhance popups to include expert name from column 4 (2026 - 1)
+if(typeof map !== 'undefined'){
+  map.on('popupopen', (e)=>{
+    try{
+      const popup = e.popup;
+      const source = popup._source;
+      const props = source && source.feature && source.feature.properties;
+      if(!props) return;
+      const code = props.Cod_patrat || props.Cod_Patrat || props.cod_patrat;
+      const em = expertMap[code] || {};
+      // build content: show Cod_patrat header and for each YES species show "Species — expert"
+      let out = '<div class="popup-header">' + (code || '') + '</div>';
+      out += '<div style="font-size:13px;margin-top:6px;">';
+      let found=false;
+      for(const k in props){
+        if(['Cod_patrat','Regiune','centroid_lon','centroid_lat'].includes(k)) continue;
+        if(props[k] === 'YES'){
+          const expert = em[k] || '';
+          out += '<div style="margin:3px 0;"><strong>' + k + '</strong>'; 
+          out += '<div style="font-size:12px;color:#666;">' + (expert? expert : '<em>— niciun expert</em>') + '</div></div>';
+          found = true;
+        }
+      }
+      if(!found) out += '<div style="color:#bbb;font-size:13px;">Nicio specie pozitivă în acest pătrat.</div>';
+      out += '</div>';
+      const node = popup.getElement ? popup.getElement().querySelector('.leaflet-popup-content') : document.querySelector('.leaflet-popup-content');
+      if(node) node.innerHTML = out;
+    }catch(err){ console.warn('popup enhancement error', err); }
+  });
+}
+</script>
+<script>
+(function(){
+  function createStatusControl(){
+    const StatusControl = L.Control.extend({
+      onAdd: function(map){
+        const div = L.DomUtil.create('div','status-toggle-control leaflet-bar');
+        div.style.background = 'white';
+        div.style.padding = '6px';
+        div.style.fontSize = '13px';
+        div.style.borderRadius = '4px';
+        div.innerHTML = '<label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="status-toggle"> Afișează stare alocare</label>';
+        L.DomEvent.disableClickPropagation(div);
+        return div;
+      }
+    });
+    map.addControl(new StatusControl({ position: 'topleft' }));
+    const cb = document.getElementById('status-toggle');
+    if(cb){
+      cb.checked = false; // default off
+      cb.addEventListener('change', (e)=>{
+        if(e.target.checked){
+          if(typeof statusLayer !== 'undefined' && statusLayer){
+            if(!map.hasLayer(statusLayer)) { map.addLayer(statusLayer); if(statusOutlineLayer && !map.hasLayer(statusOutlineLayer)) map.addLayer(statusOutlineLayer); }
+            if(statusLayer.getLayers().length === 0) buildExpertMapsAndStatus();
+          } else {
+            statusLayer = L.layerGroup({ pane: 'statusPane' }); statusOutlineLayer = L.geoJSON(null, { pane: 'statusPane', style: function(feature){ return { color: (feature && feature.properties && feature.properties._statusColor) ? feature.properties._statusColor : '#000', weight: 3, fill: false }; } });
+            buildExpertMapsAndStatus();
+            map.addLayer(statusLayer);
+          }
+        } else {
+          if(typeof statusLayer !== 'undefined' && statusLayer && map.hasLayer(statusLayer)) { map.removeLayer(statusLayer); if(statusOutlineLayer && map.hasLayer(statusOutlineLayer)) map.removeLayer(statusOutlineLayer); }
+        }
+      });
+    }
+  }
+  if(typeof map !== 'undefined') createStatusControl(); else document.addEventListener('DOMContentLoaded', createStatusControl);
+})();
+</script>
+<script>
+(function(){
+  // Replace existing popup behavior: show all YES species with expert name from CSV (column 4).
+  if(typeof map === 'undefined') return;
+  // remove previous popupopen handlers
+  try{ map.off('popupopen'); }catch(e){}
+
+  map.on('popupopen', function(e){
+    try{
+      const popup = e.popup;
+      const source = popup._source;
+      const props = source && source.feature && source.feature.properties;
+      if(!props) return;
+      const code = props.Cod_patrat || props.Cod_Patrat || props.cod_patrat || '';
+      let out = '<div class="popup-header">' + (code || '') + '</div>';
+      out += '<div style="font-size:13px;margin-top:6px;">';
+      let found = false;
+      // iterate species keys in a stable order (Object.keys preserves insertion order)
+      const keys = Object.keys(props);
+      for(let i=0;i<keys.length;i++){
+        const k = keys[i];
+        if(['Cod_patrat','Regiune','centroid_lon','centroid_lat'].includes(k)) continue;
+        if(props[k] === 'YES'){
+          found = true;
+          const expert = (window.expertMap && window.expertMap[code] && window.expertMap[code][k]) || '';
+          if(expert && expert.toString().trim().length>0){
+            // mark as done (strike-through) and show expert name
+            out += '<div style="margin:6px 0;"><span class="species-label" style="text-decoration:line-through;color:#777;">' + k + '</span>' +
+                   '<div style="font-size:12px;color:#666;">' + expert + '</div></div>';
+          } else {
+            // not yet assigned: show normally with placeholder
+            out += '<div style="margin:6px 0;"><span class="species-label" style="font-weight:bold;color:#2ecc71;">' + k + '</span>' +
+                   '<div style="font-size:12px;color:#666;"><em>— niciun expert</em></div></div>';
+          }
+        }
+      }
+      if(!found) out += '<div style="color:#bbb;font-size:13px;">Nicio specie pozitivă în acest pătrat.</div>';
+      out += '</div>';
+      var contentNode = popup.getElement ? popup.getElement().querySelector('.leaflet-popup-content') : document.querySelector('.leaflet-popup-content');
+      if(contentNode) contentNode.innerHTML = out;
+    }catch(err){ console.warn('popup rebuild error',err); }
+  });
+})();
+</script>
+<script>
+// Add sidebar controls: status toggle and refresh button, and hide sidebar button
+(function(){
+  // remove the top-left status control if present (we'll use sidebar)
+  const ctl = document.querySelector('.status-toggle-control'); if(ctl) ctl.remove();
+
+  function createSidebarStatusControls(){
+    const container = document.querySelector('#sidebar .scroll-area');
+    if(!container) return;
+    
+    const columns = ['2026-1', '2026-2', '2027-1', '2027-2'];
+    
+    const el = document.createElement('div');
+    el.className = 'filter-group';
+    el.innerHTML = `
+      <h3>Alocare specii</h3>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:8px;">
+        ${columns.map((col, idx) => `
+          <label style="display:flex;align-items:center;gap:6px">
+            <input type="radio" name="allocation-column" id="alloc-${col}" value="${col}" ${idx === 0 ? 'checked' : ''}>
+            <span style="font-size:13px;">Alocare + ${col}</span>
+          </label>
+        `).join('')}
+      </div>
+      <button id="status-refresh-sidebar" class="toggle-btn" style="padding:6px 8px;width:100%;">Reîncarcă date CSV</button>
+      <div style="font-size:12px;color:#bbb;margin-top:8px;">Date din: <a href="${CSV_URL_2}" target="_blank" rel="noopener">Google Sheets CSV</a></div>
+    `;
+    container.insertBefore(el, container.firstChild);
+
+    const refreshBtn = document.getElementById('status-refresh-sidebar');
+    const radios = document.querySelectorAll('input[name="allocation-column"]');
+
+    window.activeAllocationColumn = '2026-1';
+    buildExpertMapsAndStatus();
+
+    radios.forEach(radio => {
+      radio.addEventListener('change', (e)=>{
+        if(e.target.checked){
+          window.activeAllocationColumn = e.target.value;
+          buildExpertMapsAndStatus();
+        }
+      });
+    });
+
+    refreshBtn.addEventListener('click', ()=>{
+      buildExpertMapsAndStatus();
+    });
+
+    // when menu-toggle is clicked to show sidebar, ensure it is visible again
+    const mt = document.getElementById('menu-toggle');
+    if(mt) mt.addEventListener('click', ()=>{
+      const sb = document.getElementById('sidebar');
+      if(sb){ sb.style.display = 'flex'; }
+    });
+
+    // wire existing species/region checkboxes to trigger overlay updates
+    function attachFilterListeners(){
+      const boxes = document.querySelectorAll('.species-cb, .region-cb');
+      boxes.forEach(b=>{ b.addEventListener('change', ()=>{ buildExpertMapsAndStatus(); }); });
+    }
+    attachFilterListeners();
+
+    // monkeypatch applyFilters to trigger overlay update after running
+    if(typeof applyFilters === 'function'){
+      const orig = applyFilters;
+      window.applyFilters = function(){ try{ orig(); }catch(e){ console.warn('applyFilters orig error',e); } finally{ buildExpertMapsAndStatus(); } };
+    }
+  }
+
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', createSidebarStatusControls); else createSidebarStatusControls();
+})();
+</script>
 </body>
 </html>

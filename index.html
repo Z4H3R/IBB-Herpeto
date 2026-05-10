@@ -270,20 +270,20 @@
             style: function(feature) {
                 var p = feature.properties;
                 var isSearched = searchedCodes.some(code => p.Cod_patrat.toUpperCase().includes(code));
-                
+
                 if (isSearched) {
                     return { fillColor: "#e74c3c", color: "#2c3e50", weight: 3, fillOpacity: 0.8, dashArray: "" };
                 }
-                
+
                 var color = regionColors[p.Regiune] || "#3498db";
                 return { fillColor: color, color: "white", weight: 1, fillOpacity: 0.4 };
             },
             onEachFeature: function(feature, layer) {
                 layer.bindPopup(buildPopup(feature.properties));
-                
+
                 var p = feature.properties;
                 var isSearched = searchedCodes.some(code => p.Cod_patrat.toUpperCase().includes(code));
-                
+
                 var marker = L.circleMarker([p.centroid_lat, p.centroid_lon], {
                     radius: isSearched ? 8 : 6,
                     fillColor: isSearched ? "#e74c3c" : (regionColors[p.Regiune] || "#3498db"),
@@ -518,6 +518,14 @@ async function buildExpertMapsAndStatus(){
         const props = f.properties || {};
         const code = props.Cod_patrat;
         if(!code) return;
+        
+        // Apply region and species filters
+        const activeRegions = Array.from(document.querySelectorAll('.region-cb:checked')).map(cb => cb.value);
+        const activeSpecies = Array.from(document.querySelectorAll('.species-cb:checked')).map(cb => cb.value);
+        
+        if (!activeRegions.includes(props.Regiune)) return;
+        if (!activeSpecies.some(s => props[s] === 'YES')) return;
+        
         let totalYes = 0, missingCount = 0;
         for(const k in props){
           if(['Cod_patrat','Regiune','centroid_lon','centroid_lat'].includes(k)) continue;
@@ -550,8 +558,9 @@ async function buildExpertMapsAndStatus(){
 }
 
 // initial run and periodic refresh
-buildExpertMapsAndStatus();
-setInterval(buildExpertMapsAndStatus, 5*60*1000);
+// Only run if allocation view is active
+if(window.allocationViewActive) buildExpertMapsAndStatus();
+setInterval(()=>{ if(window.allocationViewActive) buildExpertMapsAndStatus(); }, 5*60*1000);
 
 // Enhance popups to include expert name from column 4 (2026 - 1)
 if(typeof map !== 'undefined'){
@@ -646,15 +655,21 @@ if(typeof map !== 'undefined'){
         if(['Cod_patrat','Regiune','centroid_lon','centroid_lat'].includes(k)) continue;
         if(props[k] === 'YES'){
           found = true;
-          const expert = (window.expertMap && window.expertMap[code] && window.expertMap[code][k]) || '';
-          if(expert && expert.toString().trim().length>0){
-            // mark as done (strike-through) and show expert name
-            out += '<div style="margin:6px 0;"><span class="species-label" style="text-decoration:line-through;color:#777;">' + k + '</span>' +
-                   '<div style="font-size:12px;color:#666;">' + expert + '</div></div>';
+          // Only show expert info if allocation view is active
+          if(window.allocationViewActive){
+            const expert = (window.expertMap && window.expertMap[code] && window.expertMap[code][k]) || '';
+            if(expert && expert.toString().trim().length>0){
+              // mark as done (strike-through) and show expert name
+              out += '<div style="margin:6px 0;"><span class="species-label" style="text-decoration:line-through;color:#777;">' + k + '</span>' +
+                     '<div style="font-size:12px;color:#666;">' + expert + '</div></div>';
+            } else {
+              // not yet assigned: show normally with placeholder
+              out += '<div style="margin:6px 0;"><span class="species-label" style="font-weight:bold;color:#2ecc71;">' + k + '</span>' +
+                     '<div style="font-size:12px;color:#666;"><em>— niciun expert</em></div></div>';
+            }
           } else {
-            // not yet assigned: show normally with placeholder
-            out += '<div style="margin:6px 0;"><span class="species-label" style="font-weight:bold;color:#2ecc71;">' + k + '</span>' +
-                   '<div style="font-size:12px;color:#666;"><em>— niciun expert</em></div></div>';
+            // Show only species name when not in allocation view
+            out += '<div class="specie-yes">✓ ' + k + '</div>';
           }
         }
       }
@@ -683,9 +698,13 @@ if(typeof map !== 'undefined'){
     el.innerHTML = `
       <h3>Alocare specii</h3>
       <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:8px;">
+        <label style="display:flex;align-items:center;gap:6px">
+          <input type="radio" name="allocation-view" id="alloc-fara" value="fara-alocare" checked onchange="applyFilters()">
+          <span style="font-size:13px;">Fără alocare</span>
+        </label>
         ${columns.map((col, idx) => `
           <label style="display:flex;align-items:center;gap:6px">
-            <input type="radio" name="allocation-column" id="alloc-${col}" value="${col}" ${idx === 0 ? 'checked' : ''}>
+            <input type="radio" name="allocation-view" id="alloc-${col}" value="${col}" onchange="applyFilters()">
             <span style="font-size:13px;">Alocare + ${col}</span>
           </label>
         `).join('')}
@@ -696,16 +715,52 @@ if(typeof map !== 'undefined'){
     container.insertBefore(el, container.firstChild);
 
     const refreshBtn = document.getElementById('status-refresh-sidebar');
-    const radios = document.querySelectorAll('input[name="allocation-column"]');
+    const radios = document.querySelectorAll('input[name="allocation-view"]');
 
-    window.activeAllocationColumn = '2026-1';
-    buildExpertMapsAndStatus();
+    window.activeAllocationColumn = null;
+    window.allocationViewActive = false;
 
     radios.forEach(radio => {
       radio.addEventListener('change', (e)=>{
         if(e.target.checked){
-          window.activeAllocationColumn = e.target.value;
-          buildExpertMapsAndStatus();
+          if(e.target.value === 'fara-alocare'){
+            window.allocationViewActive = false;
+            window.activeAllocationColumn = null;
+            window.expertMap = {};
+            if(typeof statusOutlineLayer !== 'undefined' && statusOutlineLayer && map.hasLayer(statusOutlineLayer)) {
+              map.removeLayer(statusOutlineLayer);
+            }
+            if(typeof statusLayer !== 'undefined' && statusLayer && map.hasLayer(statusLayer)) {
+              map.removeLayer(statusLayer);
+            }
+            applyFilters();
+            // Refresh any open popup to show only species info
+            if(map._popup){
+              try{ map.closePopup(); setTimeout(()=>{ if(map._popup) map._popup.openOn(map); }, 50); }catch(e){}
+            }
+          } else {
+            window.allocationViewActive = true;
+            window.activeAllocationColumn = e.target.value;
+            // Ensure status layers are initialized before building data
+            if(!statusLayer){
+              if(!map.getPane('statusPane')){ map.createPane('statusPane'); map.getPane('statusPane').style.zIndex = 650; }
+              statusLayer = L.layerGroup([], { pane: 'statusPane' });
+            }
+            if(!statusOutlineLayer){
+              if(!map.getPane('statusPane')){ map.createPane('statusPane'); map.getPane('statusPane').style.zIndex = 650; }
+              statusOutlineLayer = L.geoJSON(null, {
+                pane: 'statusPane',
+                style: function(feature){
+                  return { color: (feature && feature.properties && feature.properties._statusColor) ? feature.properties._statusColor : '#000', weight: 3, fill: false };
+                }
+              });
+            }
+            // Add layers to map first, then populate with data
+            if(!map.hasLayer(statusOutlineLayer)) map.addLayer(statusOutlineLayer);
+            if(!map.hasLayer(statusLayer)) map.addLayer(statusLayer);
+            // Now populate the data
+            buildExpertMapsAndStatus();
+          }
         }
       });
     });
@@ -724,14 +779,14 @@ if(typeof map !== 'undefined'){
     // wire existing species/region checkboxes to trigger overlay updates
     function attachFilterListeners(){
       const boxes = document.querySelectorAll('.species-cb, .region-cb');
-      boxes.forEach(b=>{ b.addEventListener('change', ()=>{ buildExpertMapsAndStatus(); }); });
+      boxes.forEach(b=>{ b.addEventListener('change', ()=>{ if(window.allocationViewActive) buildExpertMapsAndStatus(); }); });
     }
     attachFilterListeners();
 
     // monkeypatch applyFilters to trigger overlay update after running
     if(typeof applyFilters === 'function'){
       const orig = applyFilters;
-      window.applyFilters = function(){ try{ orig(); }catch(e){ console.warn('applyFilters orig error',e); } finally{ buildExpertMapsAndStatus(); } };
+      window.applyFilters = function(){ try{ orig(); }catch(e){ console.warn('applyFilters orig error',e); } finally{ if(window.allocationViewActive) buildExpertMapsAndStatus(); } };
     }
   }
 
